@@ -1,4 +1,3 @@
-
 import io
 import os
 import re
@@ -185,7 +184,6 @@ def pick_dst_and_bench(work_no_dst: pd.DataFrame,
                        starters: pd.DataFrame,
                        bench_locked_df: pd.DataFrame,
                        reserve: int,
-                       max_bench_qbs: int,
                        bench_slots: int) -> Tuple[Optional[Dict], List[Dict], int]:
     remaining_reserve = reserve
     dst_choice = None
@@ -214,20 +212,19 @@ def pick_dst_and_bench(work_no_dst: pd.DataFrame,
     bench_pool = bench_pool[bench_pool["Pos"].isin(["QB","RB","WR","TE","K"])]
     bench_pool["Cost"] = bench_pool["Cost"].apply(ceil_dollars)
 
+    # prefer filling RB/WR/TE first, then QB, then K (no QB cap now)
     pos_bucket = {"RB":0,"WR":0,"TE":0,"QB":1,"K":2}
-    bench_pool = bench_pool.sort_values(by=["Pos","Cost"], key=lambda s: s.map(pos_bucket) if s.name=="Pos" else s)
+    bench_pool = bench_pool.sort_values(by=["Pos","Cost"],
+                                        key=lambda s: s.map(pos_bucket) if s.name=="Pos" else s)
 
-    bench_qb_count = int(sum(1 for r in bench_list if r["Pos"]=="QB"))
     bench_spots_left = max(0, int(bench_slots) - len(bench_list))
 
     for _, r in bench_pool.iterrows():
         if bench_spots_left <= 0 or remaining_reserve <= 0: break
         cost_i = int(r["Cost"])
         if remaining_reserve - cost_i < 0: continue
-        if r["Pos"] == "QB" and bench_qb_count >= max_bench_qbs: continue
         bench_list.append({"Name": r["Name"], "Team": r["Team"], "Pos": r["Pos"], "Points": r["Points"], "Cost": cost_i})
         remaining_reserve -= cost_i
-        if r["Pos"] == "QB": bench_qb_count += 1
         bench_spots_left -= 1
 
     return (None if dst_choice is None else dict(dst_choice)), bench_list, remaining_reserve
@@ -238,11 +235,22 @@ st.set_page_config(page_title="Auction Optimizer (Live Draft)", layout="wide")
 st.title("🏈 Live Auction Optimizer")
 st.caption("Projections are treated as **Half-PPR**, based on the CSV columns (Consensus/DS).")
 
+# --- Auto-load CSV from your app folder ---
+DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "auction-values-half-ppr.csv")
+uploaded = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else None
+
+# session state for work table + overrides + taken (leaguemates' picks)
+if "work" not in st.session_state:
+    st.session_state.work = None
+if "overrides_df" not in st.session_state:
+    st.session_state.overrides_df = pd.DataFrame(columns=["Name","Cost","Starter"])
+if "taken" not in st.session_state:
+    st.session_state.taken = []  # list of player names marked as drafted by others
+
 with st.sidebar:
     st.header("Settings")
     budget = st.number_input("Total budget", min_value=1, value=200, step=1)
     reserve = st.number_input("Reserve for DST + Bench", min_value=0, value=5, step=1)
-    max_bench_qbs = st.number_input("Max bench QBs", min_value=0, value=1, step=1)
 
     st.subheader("Starter slots (no DST)")
     qb_slots = st.number_input("QB", min_value=0, value=1, step=1)
@@ -266,16 +274,6 @@ with st.sidebar:
     alts_min_points = st.number_input("Min projected points", min_value=0.0, value=170.0, step=5.0)
     alts_per_pos = st.number_input("Alternatives per position", min_value=1, value=12, step=1)
 
-# --- Auto-load CSV from your app folder ---
-DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "auction-values-half-ppr.csv")
-uploaded = DEFAULT_CSV if os.path.exists(DEFAULT_CSV) else None
-
-# session state for work table + overrides editor
-if "work" not in st.session_state:
-    st.session_state.work = None
-if "overrides_df" not in st.session_state:
-    st.session_state.overrides_df = pd.DataFrame(columns=["Name","Cost","Starter"])
-
 def ensure_overrides_df(names_list: List[str]):
     df = st.session_state.overrides_df.copy()
     df = df[df["Name"].isin(names_list)]
@@ -298,49 +296,79 @@ if uploaded is not None:
         work = build_working_table(df_values, w_consensus, w_ds, w_market, w_dsa)
         st.session_state.work = work
 
-        # Build options for search dropdown
+        # Build options for search dropdowns
         options_df = work.copy()
         options_df["Label"] = options_df.apply(lambda r: f"{r['Name']} ({r['Pos']}, {r['Team']})".strip(), axis=1)
         name_by_label = dict(zip(options_df["Label"], options_df["Name"]))
         labels_sorted = sorted(options_df["Label"].tolist())
 
-        st.subheader("Add a purchase (live override)")
-        colp1, colp2, colp3, colp4 = st.columns([3,1,1,1])
-        with colp1:
-            pick_label = st.selectbox("Search player", options=[""] + labels_sorted, index=0, placeholder="Type to search…")
-        with colp2:
-            paid = st.number_input("Price paid ($)", min_value=0, value=0, step=1)
-        with colp3:
-            starter_flag = st.toggle("Starter?", value=True)
-        with colp4:
-            if st.button("Add / Update"):
-                if pick_label and pick_label in name_by_label and paid > 0:
-                    add_override_row(name_by_label[pick_label], int(paid), bool(starter_flag))
+        # ===== Top row: right box shows taken players =====
+        top_left, top_right = st.columns([3,1])
+        with top_left:
+            st.subheader("Add a purchase (live override)")
+            colp1, colp2, colp3, colp4 = st.columns([3,1,1,1])
+            with colp1:
+                pick_label = st.selectbox("Search player", options=[""] + labels_sorted, index=0, placeholder="Type to search…")
+            with colp2:
+                paid = st.number_input("Price paid ($)", min_value=0, value=0, step=1, key="price_paid")
+            with colp3:
+                starter_flag = st.toggle("Starter?", value=True, key="starter_toggle")
+            with colp4:
+                if st.button("Add / Update", key="add_update_purchase"):
+                    if pick_label and pick_label in name_by_label and paid > 0:
+                        add_override_row(name_by_label[pick_label], int(paid), bool(starter_flag))
+                    else:
+                        st.warning("Pick a player and enter a positive price.")
+
+            # Editable overrides table
+            st.markdown("#### Current purchases")
+            ensure_overrides_df(work["Name"].tolist())
+
+            overrides_editor = st.data_editor(
+                st.session_state.overrides_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="overrides_editor",
+                column_config={
+                    "Name": st.column_config.SelectboxColumn(
+                        "Name",
+                        options=sorted(work["Name"].unique().tolist()),
+                        required=True,
+                        width="medium"
+                    ),
+                    "Cost": st.column_config.NumberColumn("Cost ($)", min_value=0, step=1, required=True),
+                    "Starter": st.column_config.CheckboxColumn("Starter?", default=True)
+                }
+            )
+            st.session_state.overrides_df = overrides_editor
+
+        with top_right:
+            st.subheader("Taken")
+            if st.session_state.taken:
+                taken_df = pd.DataFrame({"Player": st.session_state.taken})
+                st.dataframe(taken_df, hide_index=True, use_container_width=True, height=240)
+            else:
+                st.caption("No opponents’ picks logged yet.")
+
+        # ===== Log leaguemates' picks (exclusions) =====
+        st.markdown("---")
+        st.subheader("Leaguemates’ Picks (exclude from pool)")
+        colx1, colx2, colx3 = st.columns([3,1,1])
+        with colx1:
+            taken_label = st.selectbox("Search player to mark as TAKEN", options=[""] + labels_sorted, index=0, placeholder="Type to search…", key="taken_select")
+        with colx2:
+            if st.button("Mark TAKEN", key="mark_taken"):
+                if taken_label and taken_label in name_by_label:
+                    pname = name_by_label[taken_label]
+                    if pname not in st.session_state.taken:
+                        st.session_state.taken.append(pname)
                 else:
-                    st.warning("Pick a player and enter a positive price.")
+                    st.warning("Pick a player to mark as taken.")
+        with colx3:
+            if st.button("Clear TAKEN list", type="secondary", key="clear_taken"):
+                st.session_state.taken = []
 
-        # Editable overrides table (add/remove rows inline)
-        st.markdown("#### Current purchases")
-        ensure_overrides_df(work["Name"].tolist())
-
-        overrides_editor = st.data_editor(
-            st.session_state.overrides_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            key="overrides_editor",
-            column_config={
-                "Name": st.column_config.SelectboxColumn(
-                    "Name",
-                    options=sorted(work["Name"].unique().tolist()),
-                    required=True,
-                    width="medium"
-                ),
-                "Cost": st.column_config.NumberColumn("Cost ($)", min_value=0, step=1, required=True),
-                "Starter": st.column_config.CheckboxColumn("Starter?", default=True)
-            }
-        )
-        st.session_state.overrides_df = overrides_editor
-
+        # ===== Action buttons =====
         col_run, col_clear = st.columns([1,1])
         with col_run:
             run_btn = st.button("⚡ Optimize", type="primary")
@@ -352,9 +380,13 @@ if uploaded is not None:
         if run_btn:
             work = st.session_state.work.copy()
 
-            # Separate DST pool
-            dst_pool = work[work["Pos"] == "DST"].copy()
-            work_no_dst = work[work["Pos"] != "DST"].copy()
+            # Determine taken players that are NOT your purchases (yours override exclusions)
+            my_purchases = set(st.session_state.overrides_df["Name"].tolist())
+            taken_not_mine = [n for n in st.session_state.taken if n not in my_purchases]
+
+            # Separate DST pool, excluding taken_not_mine
+            dst_pool = work[(work["Pos"] == "DST") & (~work["Name"].isin(taken_not_mine))].copy()
+            work_no_dst = work[(work["Pos"] != "DST") & (~work["Name"].isin(taken_not_mine))].copy()
 
             # Convert overrides into locks
             ov = st.session_state.overrides_df.copy()
@@ -399,7 +431,7 @@ if uploaded is not None:
                 remaining_for_bench = max(0, int(reserve) - bench_cost_locked)
                 dst_choice, bench_list, reserve_left = pick_dst_and_bench(
                     work_no_dst.copy(), dst_pool.copy(), starters, bench_locked.copy(),
-                    remaining_for_bench, int(max_bench_qbs), int(bench_slots)
+                    remaining_for_bench, int(bench_slots)
                 )
 
                 # Order starters nicely
